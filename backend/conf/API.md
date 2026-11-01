@@ -297,3 +297,100 @@ Modify an existing user’s data.
 - **400 Bad Request**: Invalid input data.
 - **403 Forbidden**: No permission.
 
+---
+
+### 13. Clock In / Clock Out / Today's Punches
+
+**Endpoint:**
+![POST](https://img.shields.io/badge/POST-FF4136?style=flat-square&logo=appveyor&logoColor=white) `/clockin`
+
+**Description:**  
+`type` 0 returns today's (or `day`'s) live segments of the account, `1` records a clock-in, `-1` a clock-out. A clock-in fills the first live segment without a clock-in, otherwise opens a new segment (same for clock-out). Soft-deleted segments are ignored.
+
+**Duplicate guard:** a punch of the same kind (clock-in or clock-out) less than **5 minutes** after another live punch of that kind on the same day is **not recorded** and returns `409`.
+
+**Request Body:**
+```json
+{
+  "account": "string",
+  "cookie": "string",
+  "type": 1              // 0 = list, 1 = clock-in, -1 = clock-out
+}
+```
+
+**Response:**
+- **200 OK**: `{"status": 200}` recorded (or the segment list for `type` 0).
+- **409 Conflict**: `{"status": 409, "message": "已打過上班卡" | "已打過下班卡"}`, nothing recorded.
+- **400 Bad Request** / **403 Forbidden**: invalid input / not allowed.
+
+---
+
+### 14. Clock-In Day / Month Views (admin)
+
+**Endpoints:**
+![GET](https://img.shields.io/badge/GET-2ECC40?style=flat-square&logo=appveyor&logoColor=white) `/api/clockin/view?account&cookie&year&month&day`  
+![GET](https://img.shields.io/badge/GET-2ECC40?style=flat-square&logo=appveyor&logoColor=white) `/api/clockin/day?account&cookie&year&month&day`  
+![GET](https://img.shields.io/badge/GET-2ECC40?style=flat-square&logo=appveyor&logoColor=white) `/api/clockin/employee?account&cookie&year&month&id`
+
+**Per person/day fields:** `clockin` (first clock-in), `clockout` (last clock-out), `workHours` (e.g. `"8:00"` or `"8:00（1段不完整）"`), `workMinutes`, `incompleteSegments`, `modified`, `reason`, `editorName`, `editedAt`.
+
+`workHours` is the sum of every live segment that has both a clock-in and a clock-out (clock-out not earlier than clock-in). Segments with only one side are not counted and are reported in `incompleteSegments`. Soft-deleted segments never count. A day that only has a legacy whole-day correction (`/api/clockin/edit`) uses that correction's clock-in/clock-out as one pair.
+
+The monthly master PDF (`/api/clockin/master`), the personal PDF (`/api/clockin/personal`) and the Excel helper carry the same columns: 首次上班, 末次下班, 當日工時.
+
+**Response:** 200 / 400 / 403 (employees are rejected).
+
+---
+
+### 15. List Segments of One Day (admin)
+
+**Endpoint:**
+![GET](https://img.shields.io/badge/GET-2ECC40?style=flat-square&logo=appveyor&logoColor=white) `/api/clockin/segments?account&cookie&id&date=YYYY-MM-DD`
+
+**Response (200):**
+```json
+{
+  "employee": {"id": "string", "name": "string"},
+  "date": "2026-02-02",
+  "segments": [{"num": 1, "clockin": "09:00", "clockout": "12:00", "deleted": false}],
+  "workHours": "8:00", "workMinutes": 480, "incompleteSegments": 0,
+  "segmentMode": true,        // the day has segment-level corrections
+  "legacyPreview": false,     // true: only a legacy correction exists; segments shown are what editing will start from
+  "legacyEdit": null,         // legacy clockin_edit row, if any
+  "log": [{"seq": 1, "num": 1, "action": "update", "oldClockin": "...", "newClockin": "...", "reason": "...", "editorId": "...", "editorName": "...", "editedAt": "..."}]
+}
+```
+Soft-deleted segments are included here (`deleted: true`) but never in reports. 404 when the employee does not exist.
+
+---
+
+### 16. Edit / Add / Delete a Segment (admin only)
+
+**Endpoints:**
+![POST](https://img.shields.io/badge/POST-FF4136?style=flat-square&logo=appveyor&logoColor=white) `/api/clockin/segment/edit`  
+![POST](https://img.shields.io/badge/POST-FF4136?style=flat-square&logo=appveyor&logoColor=white) `/api/clockin/segment/add`  
+![POST](https://img.shields.io/badge/POST-FF4136?style=flat-square&logo=appveyor&logoColor=white) `/api/clockin/segment/delete`
+
+**Request Body:**
+```json
+{
+  "account": "string", "cookie": "string",   // admin
+  "id": "string",                            // employee id
+  "date": "YYYY-MM-DD",                      // not in the future
+  "num": 2,                                  // edit / delete only
+  "clockin": "HH:MM or null",                // edit / add (at least one of clockin/clockout)
+  "clockout": "HH:MM or null",
+  "reason": "string"                         // required, max 200 chars, every call
+}
+```
+
+- Every call needs a `reason`; editor and time are recorded in `clockin_segment_log`.
+- `delete` is a **soft delete** (`clockinrecord.deleted = 1`); the row and its values stay in the database.
+- The first segment edit of a day that has a legacy `clockin_edit` row folds its first clock-in / last clock-out into the segments (logged as `legacy-merge`). The `clockin_edit` row itself is kept; from then on the day is in segment mode and `/api/clockin/edit` returns 409 for it.
+- No-op requests, rejected requests and failed validation change nothing.
+
+**Response:**
+- **200 OK**: `{"status": "saved", "num": 2}` or `{"status": "unchanged"}`.
+- **400 Bad Request**: `{"message": "..."}` (bad time, missing reason, future date, ...).
+- **403 Forbidden**: not an admin / bad session.
+- **404 Not Found**: unknown employee or segment.

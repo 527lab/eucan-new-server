@@ -203,10 +203,12 @@ $(function () {
                     <div class="record-card-name">${displayName}</div>
                     <div class="${clockinRow}"><span>上班</span><span>${displayValue(record.clockin)}</span></div>
                     <div class="${clockoutRow}"><span>下班</span><span>${displayValue(record.clockout)}</span></div>
+                    <div class="record-card-row"><span>當日工時</span><span>${escapeHtml(workHoursText(record))}</span></div>
                     <div class="record-card-row"><span>修改紀錄</span><span>${modified ? "是" : "否"}</span></div>
                     ${modifiedRows}
                     <div class="record-card-actions">
                         ${editButton(record.id, record.name, targetDate, record.clockin, record.clockout)}
+                        ${segmentsButton(record.id, record.name, targetDate)}
                         ${downloadButton(record.id, record.name, record.downloadable, masterReady)}
                     </div>
                 </div>
@@ -238,11 +240,12 @@ $(function () {
                     <td>${escapeHtml(date)}</td>
                     <td>${displayValue(day.clockin)}</td>
                     <td>${displayValue(day.clockout)}</td>
+                    <td>${escapeHtml(workHoursText(day))}</td>
                     <td>${modified ? "是" : "否"}</td>
                     <td class="record-cell-reason">${modified ? displayValue(day.reason) : ""}</td>
                     <td>${modified ? displayValue(day.editorName) : ""}</td>
                     <td>${modified ? displayValue(day.editedAt) : ""}</td>
-                    <td>${editButton(id, name, date, day.clockin, day.clockout)}</td>
+                    <td>${editButton(id, name, date, day.clockin, day.clockout)} ${segmentsButton(id, name, date)}</td>
                 </tr>
             `;
         }
@@ -257,8 +260,9 @@ $(function () {
                     <thead>
                         <tr>
                             <th>日期</th>
-                            <th>上班</th>
-                            <th>下班</th>
+                            <th>第一次上班</th>
+                            <th>最後一次下班</th>
+                            <th>當日工時</th>
                             <th>修改紀錄</th>
                             <th>修改原因</th>
                             <th>修改的管理員</th>
@@ -501,6 +505,170 @@ $(function () {
             $("#clockinEditSave").prop("disabled", false);
         }
     }
+
+    // ---- 多段補打卡（展開各段） ----
+    const segmentsModal = new bootstrap.Modal(document.getElementById("clockinSegmentsModal"));
+    let segmentsTarget = null;
+    let segmentsBusy = false;
+
+    function workHoursText(record) {
+        if (record && typeof record.workHours === "string" && record.workHours) return record.workHours;
+        return "0:00";
+    }
+
+    function segmentsButton(id, name, date) {
+        return `<button type="button" class="btn btn-sm btn-outline-dark record-segments-btn" data-id="${attr(id)}" data-name="${attr(name)}" data-date="${attr(date)}">展開各段</button>`;
+    }
+
+    async function fetchSegments(id, date) {
+        const url = `${apiBase}/api/clockin/segments?account=${encodeURIComponent(userId)}&cookie=${encodeURIComponent(sessionKey)}&id=${encodeURIComponent(id)}&date=${encodeURIComponent(date)}`;
+        try {
+            const resp = await fetch(url, { method: "GET", credentials: "include" });
+            if (!resp.ok) return null;
+            return await resp.json();
+        } catch (error) {
+            console.error(error);
+            return null;
+        }
+    }
+
+    const ACTION_LABELS = { add: "新增", update: "修改", delete: "刪除", "legacy-merge": "沿用舊補正" };
+
+    function renderSegments(data) {
+        if (!data || !Array.isArray(data.segments)) {
+            $("#clockinSegmentsBody").html('<div class="calendar-empty">無法取得各段資料。</div>');
+            return;
+        }
+        let rows = "";
+        for (const seg of data.segments) {
+            if (seg.deleted) {
+                rows += `<tr class="table-secondary text-decoration-line-through"><td>${Number(seg.num)}</td><td>${displayValue(seg.clockin)}</td><td>${displayValue(seg.clockout)}</td><td>已刪除</td></tr>`;
+                continue;
+            }
+            rows += `
+                <tr data-num="${Number(seg.num)}">
+                    <td>${Number(seg.num)}</td>
+                    <td><input type="time" class="form-control form-control-sm seg-in" value="${attr(toTimeInput(seg.clockin))}"></td>
+                    <td><input type="time" class="form-control form-control-sm seg-out" value="${attr(toTimeInput(seg.clockout))}"></td>
+                    <td>
+                        <button type="button" class="btn btn-sm btn-primary seg-save">儲存</button>
+                        <button type="button" class="btn btn-sm btn-outline-danger seg-delete">刪除</button>
+                    </td>
+                </tr>`;
+        }
+        rows += `
+            <tr class="table-light">
+                <td>新增</td>
+                <td><input type="time" class="form-control form-control-sm seg-new-in"></td>
+                <td><input type="time" class="form-control form-control-sm seg-new-out"></td>
+                <td><button type="button" class="btn btn-sm btn-success seg-add">新增一段</button></td>
+            </tr>`;
+
+        let notes = "";
+        if (data.legacyPreview && data.legacyEdit) {
+            notes += `<div class="alert alert-info py-2">這天原本有整天補正（${escapeHtml(data.legacyEdit.editorName || "")}：${escapeHtml(data.legacyEdit.reason || "")}）。第一次在這裡修改時，補正的上班／下班時間會併入各段（下表已是併入後的樣子），原補正資料仍保留。</div>`;
+        }
+        const incompleteNote = data.incompleteSegments > 0 ? `（有 ${Number(data.incompleteSegments)} 段不完整，未計入工時）` : "";
+        let logRows = "";
+        for (const entry of (data.log || [])) {
+            logRows += `<tr>
+                <td>${escapeHtml(entry.editedAt || "")}</td>
+                <td>${escapeHtml(entry.editorName || "")}</td>
+                <td>${escapeHtml(ACTION_LABELS[entry.action] || entry.action)} 第${Number(entry.num)}段</td>
+                <td>${displayValue(entry.oldClockin)} / ${displayValue(entry.oldClockout)}</td>
+                <td>${displayValue(entry.newClockin)} / ${displayValue(entry.newClockout)}</td>
+                <td>${escapeHtml(entry.reason || "")}</td>
+            </tr>`;
+        }
+        const logHtml = logRows
+            ? `<details class="mt-3"><summary>異動紀錄（${data.log.length}）</summary>
+                <table class="table table-sm table-bordered mt-2"><thead><tr><th>時間</th><th>管理員</th><th>動作</th><th>原（上班/下班）</th><th>新（上班/下班）</th><th>原因</th></tr></thead><tbody>${logRows}</tbody></table></details>`
+            : "";
+        $("#clockinSegmentsBody").html(`
+            ${notes}
+            <div class="mb-2">當日工時：<strong>${escapeHtml(data.workHours || "0:00")}</strong> ${escapeHtml(incompleteNote)}</div>
+            <table class="table table-sm table-bordered align-middle">
+                <thead><tr><th>段</th><th>上班</th><th>下班</th><th>操作</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+            ${logHtml}
+        `);
+    }
+
+    async function openSegments(target) {
+        segmentsTarget = target;
+        $("#clockinSegmentsTitle").text(`各段打卡 ${target.name} ${target.date}`);
+        $("#clockinSegmentsReason").val("");
+        $("#clockinSegmentsBody").text("載入中...");
+        segmentsModal.show();
+        renderSegments(await fetchSegments(target.id, target.date));
+    }
+
+    async function segmentAction(action, extra) {
+        if (segmentsBusy || !segmentsTarget) return;
+        const target = segmentsTarget;
+        const reason = String($("#clockinSegmentsReason").val() || "").trim();
+        if (!reason) {
+            alert("請填寫修改原因");
+            return;
+        }
+        if (action === "delete" && !confirm("確定要刪除這一段？（資料會保留，只是不再列入報表）")) return;
+        segmentsBusy = true;
+        $("#clockinSegmentsBody button").prop("disabled", true);
+        try {
+            const resp = await fetch(`${apiBase}/api/clockin/segment/${action}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                credentials: "include",
+                body: JSON.stringify(Object.assign({ account: userId, cookie: sessionKey, id: target.id, date: target.date, reason }, extra)),
+            });
+            let data = {};
+            try { data = await resp.json(); } catch (error) { data = {}; }
+            if (resp.ok && data.status === "saved") {
+                $("#clockinSegmentsReason").val("");
+                await renderCurrent();
+            } else if (resp.ok && data.status === "unchanged") {
+                alert(data.message || "時間沒有變更");
+            } else {
+                alert(data.message || "修改失敗");
+            }
+        } catch (error) {
+            console.error(error);
+            alert("修改失敗");
+        } finally {
+            segmentsBusy = false;
+            if (segmentsTarget === target) renderSegments(await fetchSegments(target.id, target.date));
+        }
+    }
+
+    $("#calendarGrid").on("click", ".record-segments-btn", function () {
+        openSegments({
+            id: $(this).attr("data-id") || "",
+            name: $(this).attr("data-name") || "",
+            date: $(this).attr("data-date") || "",
+        });
+    });
+    $("#clockinSegmentsBody").on("click", ".seg-save", function () {
+        const row = $(this).closest("tr");
+        segmentAction("edit", {
+            num: Number(row.attr("data-num")),
+            clockin: toTimeInput(row.find(".seg-in").val()) || null,
+            clockout: toTimeInput(row.find(".seg-out").val()) || null,
+        });
+    });
+    $("#clockinSegmentsBody").on("click", ".seg-delete", function () {
+        segmentAction("delete", { num: Number($(this).closest("tr").attr("data-num")) });
+    });
+    $("#clockinSegmentsBody").on("click", ".seg-add", function () {
+        const row = $(this).closest("tr");
+        segmentAction("add", {
+            clockin: toTimeInput(row.find(".seg-new-in").val()) || null,
+            clockout: toTimeInput(row.find(".seg-new-out").val()) || null,
+        });
+    });
+    document.getElementById("clockinSegmentsModal").addEventListener("hidden.bs.modal", () => {
+        segmentsTarget = null;
+    });
 
     async function onPeriodChange() {
         const token = ++periodToken;

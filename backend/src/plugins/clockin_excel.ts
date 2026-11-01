@@ -1,30 +1,34 @@
 // const ExcelJS = require('exceljs');
 import ExcelJS from 'exceljs';
-import { clockinrecord, digit } from '../types/types';
+import { digit } from '../types/types';
+import { ClockSheetRow, displayRowHours, displayTime } from './clockin_sheet';
 
-export async function output_excel(data:clockinrecord[], year:digit, month:digit) :Promise<void>{
-  // 1. Sort the data array by the 'date' field (ascending).
-  data.sort((a, b) => a["date"].localeCompare(b["date"]));
+/**
+ * Month sheet as Excel: first clock-in / last clock-out per day plus the day's work hours
+ * (paired segments summed, soft-deleted segments excluded). Pass rows from buildMonthSheet.
+ */
+export async function output_excel(data: ClockSheetRow[], year: digit, month: digit): Promise<void> {
+  const rows = data.slice().sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
 
-  // 2. Create a new workbook and add a worksheet.
   const workbook = new ExcelJS.Workbook();
   const worksheet = workbook.addWorksheet('Sheet1');
 
-  // 3. Add the header row.
-  worksheet.addRow(['日期', '員工編號', '員工姓名', '上班時間', '下班時間']);
+  worksheet.addRow(['日期', '員工編號', '員工姓名', '首次上班', '末次下班', '當日工時', '修改紀錄', '修改原因', '修改時間']);
 
-  // 4. Add a row for each item in the sorted data.
-  data.forEach(item => {
+  rows.forEach(item => {
     worksheet.addRow([
-      item["date"],
-      item["id"],
-      item["name"],
-      item["clockin"],
-      item["clockout"]
+      item.date,
+      item.id,
+      item.name,
+      displayTime(item.clockin),
+      displayTime(item.clockout),
+      displayRowHours(item),
+      item.modified ? '是' : '否',
+      item.modified ? item.reason : '',
+      item.modified && item.editedAt ? item.editedAt : ''
     ]);
   });
 
-  // 5. Write the workbook to a file.
   await workbook.xlsx.writeFile(`/app/clock/${year}-${month}clockin_record.xlsx`);
   console.log('Excel file created successfully!');
 }

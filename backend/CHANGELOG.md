@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.0] 2026-11-01
+
+### Added
+- Admins can expand a person's day into all clock-in segments, edit a segment's clock-in/clock-out, add a segment, or soft-delete one (`/api/clockin/segments`, `/api/clockin/segment/{edit,add,delete}`). A reason is required for every change; editor and time are logged in `clockin_segment_log`.
+- "當日工時" (work hours of the day) in the day/month/employee views, the master and personal PDFs, and the Excel helper: complete in/out pairs summed, soft-deleted segments excluded, incomplete segments flagged. The first clock-in / last clock-out columns are kept (renamed 首次上班 / 末次下班 in PDF).
+- Duplicate punch guard: a clock-in (or clock-out) less than 5 minutes after the previous one of the same kind is not recorded; `/clockin` returns 409 and the employee page shows 已打過上班卡 / 已打過下班卡.
+- `npm test` (backend) runs `tests/clockin_segments.test.js` covering duplicate detection, work hours, segment edits, legacy merge and the migration.
+
+### Changed
+- Database (idempotent, runs at startup): `clockinrecord.deleted`, table `clockin_segment_log`, `clockin_master_row.work_minutes` / `incomplete`. Existing `clockin_edit` rows are kept and still apply to days without segment edits; month masters generated before this version show 0:00 hours until reloaded.
+- A new clock-in segment number never reuses the number of a soft-deleted segment.
+- `/api/clockin/edit` returns 409 for a day already corrected per segment.
+
 ## [1.6.2] 2025-11-17
 
 ### Added

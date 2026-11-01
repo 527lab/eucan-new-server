@@ -22,5 +22,9 @@
     "nodemailer": "^6.9.15",
     "pdfkit": "^0.20.2",
     "selenium-webdriver": "^4.25.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node tests/clockin_segments.test.js"
   }
 }
