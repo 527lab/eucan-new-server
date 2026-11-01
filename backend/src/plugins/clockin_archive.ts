@@ -18,7 +18,8 @@ export async function writeClockinMaster(sqlPlugin: sql, year: string | number, 
   for (const user of sqlPlugin.getAllUsers()) {
     namesById.set(user.id, user.name || '');
   }
-  const rows = buildMonthSheet(punches, edits, namesById);
+  const segmentEdits = sqlPlugin.clockinSegmentSummariesForMonth(yearText, monthText);
+  const rows = buildMonthSheet(punches, edits, namesById, segmentEdits);
   const title = `祐肯打卡紀錄 ${yearText}年${monthText}月`;
   const pdf = await renderClockinPdf(title, rows, resolveClockinFont());
   const directory = path.join(process.cwd(), 'clock');

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import PDFDocument from 'pdfkit';
+import { computeDayHours, displayWorkHours, legacyEditHours } from './clockin_segments';
 
 export type ClockPunch = {
   id: string;
@@ -33,6 +34,10 @@ export type ClockSheetRow = {
   reason: string;
   editorName: string | null;
   editedAt: string | null;
+  /** Minutes worked that day: complete (in+out) segments summed, soft-deleted segments excluded. */
+  workMinutes: number;
+  /** Live segments that could not be paired into a work period. */
+  incompleteSegments: number;
 };
 
 export type EditDecision =
@@ -74,15 +79,22 @@ export function displayTime(value: string | null): string {
   return value ? value : '無';
 }
 
-export function aggregateDay(punches: ClockPunch[], edit: ClockEdit | null, fallbackName: string): ClockSheetRow | null {
+/**
+ * Build one sheet row for a person/day.
+ * `segmentEdit` is the latest segment-level correction summary (clockin/clockout unused). When present the
+ * day is in "segment mode": live segments are authoritative and any legacy clockin_edit row is ignored
+ * (it was folded into the segments when segment editing started and is kept in the table untouched).
+ */
+export function aggregateDay(punches: ClockPunch[], edit: ClockEdit | null, fallbackName: string, segmentEdit: ClockEdit | null = null): ClockSheetRow | null {
   const sample = punches[0];
-  const id = edit?.id || sample?.id;
-  const date = edit?.date || sample?.date;
+  const id = segmentEdit?.id || edit?.id || sample?.id;
+  const date = segmentEdit?.date || edit?.date || sample?.date;
   if (!id || !date) {
     return null;
   }
   const name = fallbackName.trim() || edit?.name || namedPunch(punches) || id;
-  if (edit) {
+  if (edit && !segmentEdit) {
+    const hours = legacyEditHours(edit.clockin, edit.clockout);
     return {
       id,
       name,
@@ -93,6 +105,8 @@ export function aggregateDay(punches: ClockPunch[], edit: ClockEdit | null, fall
       reason: edit.reason,
       editorName: edit.editorName,
       editedAt: edit.editedAt,
+      workMinutes: hours.minutes,
+      incompleteSegments: hours.incomplete,
     };
   }
 
@@ -106,20 +120,23 @@ export function aggregateDay(punches: ClockPunch[], edit: ClockEdit | null, fall
       clockout = punch.clockout;
     }
   }
+  const hours = computeDayHours(punches);
   return {
     id,
     name,
     date,
     clockin,
     clockout,
-    modified: false,
-    reason: '',
-    editorName: null,
-    editedAt: null,
+    modified: segmentEdit !== null,
+    reason: segmentEdit ? segmentEdit.reason : '',
+    editorName: segmentEdit ? segmentEdit.editorName : null,
+    editedAt: segmentEdit ? segmentEdit.editedAt : null,
+    workMinutes: hours.minutes,
+    incompleteSegments: hours.incomplete,
   };
 }
 
-export function buildMonthSheet(punches: ClockPunch[], edits: ClockEdit[], namesById: Map<string, string>): ClockSheetRow[] {
+export function buildMonthSheet(punches: ClockPunch[], edits: ClockEdit[], namesById: Map<string, string>, segmentEdits: ClockEdit[] = []): ClockSheetRow[] {
   const groups = new Map<string, ClockPunch[]>();
   for (const punch of punches) {
     if (punch.id === 'monitor') {
@@ -139,14 +156,22 @@ export function buildMonthSheet(punches: ClockPunch[], edits: ClockEdit[], names
     editMap.set(sheetKey(edit.id, edit.date), edit);
   }
 
+  const segmentMap = new Map<string, ClockEdit>();
+  for (const edit of segmentEdits) {
+    if (edit.id === 'monitor') {
+      continue;
+    }
+    segmentMap.set(sheetKey(edit.id, edit.date), edit);
+  }
+
   const rows: ClockSheetRow[] = [];
-  const keys = new Set<string>([...groups.keys(), ...editMap.keys()]);
+  const keys = new Set<string>([...groups.keys(), ...editMap.keys(), ...segmentMap.keys()]);
   for (const key of keys) {
     const [id] = key.split('\t');
     const group = groups.get(key) || [];
     const edit = editMap.get(key) || null;
     const fallback = namesById.get(id) || '';
-    const row = aggregateDay(group, edit, fallback);
+    const row = aggregateDay(group, edit, fallback, segmentMap.get(key) || null);
     if (row) {
       rows.push(row);
     }
@@ -269,14 +294,15 @@ function sheetKey(id: string, date: string): string {
 
 function pdfColumns(doc: PDFKit.PDFDocument): PdfColumn[] {
   const usable = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-  const editedAtWidth = 76;
+  const editedAtWidth = 70;
   const fixed: PdfColumn[] = [
-    { title: '日期', width: 70, value: (row) => row.date },
-    { title: '員工編號', width: 54, value: (row) => row.id },
-    { title: '員工姓名', width: 60, value: (row) => row.name },
-    { title: '上班時間', width: 48, value: (row) => displayTime(row.clockin) },
-    { title: '下班時間', width: 48, value: (row) => displayTime(row.clockout) },
-    { title: '修改紀錄', width: 52, value: (row) => row.modified ? '是' : '否' },
+    { title: '日期', width: 62, value: (row) => row.date },
+    { title: '員工編號', width: 46, value: (row) => row.id },
+    { title: '員工姓名', width: 52, value: (row) => row.name },
+    { title: '首次上班', width: 42, value: (row) => displayTime(row.clockin) },
+    { title: '末次下班', width: 42, value: (row) => displayTime(row.clockout) },
+    { title: '當日工時', width: 62, value: displayRowHours },
+    { title: '修改紀錄', width: 42, value: (row) => row.modified ? '是' : '否' },
   ];
   const used = fixed.reduce((sum, column) => sum + column.width, 0) + editedAtWidth;
   return fixed.concat(
@@ -291,6 +317,10 @@ function pdfColumns(doc: PDFKit.PDFDocument): PdfColumn[] {
       value: displayEditedAt,
     },
   );
+}
+
+export function displayRowHours(row: { workMinutes: number; incompleteSegments: number }): string {
+  return displayWorkHours({ minutes: row.workMinutes, incomplete: row.incompleteSegments });
 }
 
 function displayEditedAt(row: ClockSheetRow): string {

@@ -7,7 +7,8 @@ import { mailer } from './plugins/mailer';
 import { sqli_detect } from './plugins/anti_SQLI';
 import { check_working_day, main as generateCalendarExcel } from './plugins/dayoff_calendar';
 import { startArchiveSchedule } from './plugins/archive_schedule';
-import { aggregateDay, ClockEdit, decideEdit, isRealDate, taipeiToday } from './plugins/clockin_sheet';
+import { aggregateDay, ClockEdit, decideEdit, displayRowHours, isRealDate, taipeiToday } from './plugins/clockin_sheet';
+import { computeDayHours, displayWorkHours, formatWorkMinutes, mergeLegacyEdit } from './plugins/clockin_segments';
 import { personalClockinPdf, readMasterClockinPdf } from './plugins/clockin_archive';
 import path from 'path';
 import fs from 'fs';
@@ -250,15 +251,19 @@ app.get('/api/clockin/view', async (req: Request, res: Response) => {
     const monthRecords = await sqlPlugin.clockinRecord(yearKey, monthKey);
     const punches = indexPunches(monthRecords);
     const edits = indexEdits(sqlPlugin.clockinEditsForMonth(yearKey, monthKey));
+    const segmentEdits = indexEdits(sqlPlugin.clockinSegmentSummariesForMonth(yearKey, monthKey));
     const downloadableIds = new Set(sqlPlugin.clockinMasterRows(yearKey, monthKey).map((row) => row.id));
     const onLeaveIds = new Set(sqlPlugin.approvedLeaveIdsOnDate(date));
     const records = users.map((user) => {
-      const live = summarizeClockinDay(punches.get(clockinKey(user.id, date)) || [], edits.get(clockinKey(user.id, date)) || null, user.name);
+      const live = summarizeClockinDay(punches.get(clockinKey(user.id, date)) || [], edits.get(clockinKey(user.id, date)) || null, user.name, segmentEdits.get(clockinKey(user.id, date)) || null);
       return {
         id: user.id,
         name: user.name,
         clockin: live.clockin,
         clockout: live.clockout,
+        workHours: live.workHours,
+        workMinutes: live.workMinutes,
+        incompleteSegments: live.incompleteSegments,
         hasRecord: live.hasRecord,
         onLeave: onLeaveIds.has(user.id),
         downloadable: downloadableIds.has(user.id),
@@ -314,13 +319,17 @@ app.get('/api/clockin/day', async (req: Request, res: Response) => {
     const recordsForMonth = await sqlPlugin.clockinRecord(year, monthKey);
     const punches = indexPunches(recordsForMonth);
     const edits = indexEdits(sqlPlugin.clockinEditsForDate(targetDate));
+    const segmentEdits = indexEdits(sqlPlugin.clockinSegmentSummariesForDate(targetDate));
     const data = users.map((user) => {
-      const live = summarizeClockinDay(punches.get(clockinKey(user.id, targetDate)) || [], edits.get(clockinKey(user.id, targetDate)) || null, user.name);
+      const live = summarizeClockinDay(punches.get(clockinKey(user.id, targetDate)) || [], edits.get(clockinKey(user.id, targetDate)) || null, user.name, segmentEdits.get(clockinKey(user.id, targetDate)) || null);
       return {
         id: user.id,
         name: user.name,
         clockin: live.clockin,
         clockout: live.clockout,
+        workHours: live.workHours,
+        workMinutes: live.workMinutes,
+        incompleteSegments: live.incompleteSegments,
         hasRecord: live.hasRecord,
         modified: live.modified,
         reason: live.reason,
@@ -402,17 +411,21 @@ app.get('/api/clockin/employee', async (req: Request, res: Response) => {
     const monthRecords = await sqlPlugin.clockinRecord(yearKey, monthKey);
     const punches = indexPunches(monthRecords.filter((item) => item.id === id));
     const edits = indexEdits(sqlPlugin.clockinEditsForMonth(yearKey, monthKey).filter((item) => item.id === id));
+    const segmentEdits = indexEdits(sqlPlugin.clockinSegmentSummariesForMonth(yearKey, monthKey).filter((item) => item.id === id));
     const snapshot = sqlPlugin.clockinMasterRows(yearKey, monthKey, id);
     const totalDays = new Date(year, month, 0).getDate();
     const days = [];
     for (let day = 1; day <= totalDays; day++) {
       const date = `${yearKey}-${monthKey}-${day.toString().padStart(2, '0')}`;
-      const live = summarizeClockinDay(punches.get(clockinKey(id, date)) || [], edits.get(clockinKey(id, date)) || null, user.name || '');
+      const live = summarizeClockinDay(punches.get(clockinKey(id, date)) || [], edits.get(clockinKey(id, date)) || null, user.name || '', segmentEdits.get(clockinKey(id, date)) || null);
       days.push({
         day,
         date,
         clockin: live.clockin,
         clockout: live.clockout,
+        workHours: live.workHours,
+        workMinutes: live.workMinutes,
+        incompleteSegments: live.incompleteSegments,
         hasRecord: live.hasRecord,
         modified: live.modified,
         reason: live.reason,
@@ -458,6 +471,11 @@ app.post('/api/clockin/edit', async (req: Request, res: Response) => {
     const user = sqlPlugin.getUser(id);
     if (!user || user.type !== 'employee' || user.id === 'monitor') {
       res.status(404).json({ message: '找不到這位員工' });
+      return;
+    }
+
+    if (isRealDate(date) && sqlPlugin.hasClockinSegmentLog(id, date)) {
+      res.status(409).json({ message: '這一天已改用分段補正，請用「展開各段」修改' });
       return;
     }
 
@@ -513,6 +531,131 @@ app.post('/api/clockin/edit', async (req: Request, res: Response) => {
     res.sendStatus(500);
   }
 });
+
+// Segment-level view of one person/day (admin only): every segment incl. soft-deleted, plus audit log.
+app.get('/api/clockin/segments', async (req: Request, res: Response) => {
+  try {
+    const account = String(req.query.account || '');
+    const cookie = String(req.query.cookie || '');
+    const id = String(req.query.id || '');
+    const date = String(req.query.date || '');
+    if (!account || !cookie || !id || !isRealDate(date)) {
+      res.sendStatus(400);
+      return;
+    }
+    const ret = sqlPlugin.checkHash(account, cookie);
+    if (ret == null || ret['accountType'] == 'employee') {
+      res.sendStatus(403);
+      return;
+    }
+    const user = sqlPlugin.getUser(id);
+    if (!user || user.type !== 'employee' || user.id === 'monitor') {
+      res.status(404).json({ message: '找不到這位員工' });
+      return;
+    }
+    const segmentMode = sqlPlugin.hasClockinSegmentLog(id, date);
+    const segments = sqlPlugin.clockinSegmentsForDay(id, date, true);
+    const legacy = sqlPlugin.clockinEditsForDate(date).find((item) => item.id === id) || null;
+    // A day with only a legacy correction: show what segment editing will start from (legacy values folded in).
+    const legacyPreview = !segmentMode && legacy !== null;
+    if (legacyPreview && legacy) {
+      const nextNum = segments.reduce((max, segment) => Math.max(max, segment.num), 0) + 1;
+      for (const change of mergeLegacyEdit(segments, legacy, nextNum)) {
+        const existing = segments.find((segment) => segment.num === change.num);
+        if (existing) {
+          existing.clockin = change.after.clockin;
+          existing.clockout = change.after.clockout;
+        } else {
+          segments.push({ num: change.num, clockin: change.after.clockin, clockout: change.after.clockout, deleted: false });
+        }
+      }
+    }
+    const hours = computeDayHours(segments);
+    res.json({
+      employee: { id: user.id, name: user.name },
+      date,
+      segments,
+      workHours: displayWorkHours(hours),
+      workMinutes: hours.minutes,
+      incompleteSegments: hours.incomplete,
+      segmentMode,
+      legacyPreview,
+      legacyEdit: legacy,
+      log: sqlPlugin.clockinSegmentLog(id, date),
+    });
+  } catch (e) {
+    log.logFormat((e as string), new Date());
+    res.sendStatus(500);
+  }
+});
+
+type SegmentAction = 'edit' | 'add' | 'delete';
+
+async function handleSegmentChange(action: SegmentAction, req: Request, res: Response): Promise<void> {
+  try {
+    const body = (req.body && typeof req.body === 'object') ? req.body as { [key: string]: unknown } : {};
+    const account = bodyText(body['account']);
+    const cookie = bodyText(body['cookie']);
+    const id = bodyText(body['id']);
+    const date = bodyText(body['date']);
+    const numRaw = body['num'];
+    const num = typeof numRaw === 'number' ? numRaw : parseInt(bodyText(numRaw), 10);
+    if (!account || !cookie || !id || !date || (action !== 'add' && !Number.isInteger(num))) {
+      res.sendStatus(400);
+      return;
+    }
+    const ret = sqlPlugin.checkHash(account, cookie);
+    if (ret == null || ret['accountType'] == 'employee') {
+      res.sendStatus(403);
+      return;
+    }
+    const user = sqlPlugin.getUser(id);
+    if (!user || user.type !== 'employee' || user.id === 'monitor') {
+      res.status(404).json({ message: '找不到這位員工' });
+      return;
+    }
+    if (!isRealDate(date)) {
+      res.status(400).json({ message: '日期不正確' });
+      return;
+    }
+    if (date > taipeiToday()) {
+      res.status(400).json({ message: '不能修改未來的日期' });
+      return;
+    }
+    const input = {
+      id: user.id,
+      name: user.name || '',
+      date,
+      clockin: body['clockin'] == null ? null : String(body['clockin']),
+      clockout: body['clockout'] == null ? null : String(body['clockout']),
+      reason: body['reason'] == null ? '' : String(body['reason']),
+      editorId: account,
+      editorName: ret['name'],
+    };
+    const result = action === 'add'
+      ? sqlPlugin.addClockinSegment(input)
+      : action === 'edit'
+        ? sqlPlugin.editClockinSegment({ ...input, num })
+        : sqlPlugin.deleteClockinSegment({ ...input, num });
+    if (!result.ok) {
+      res.status(result.status).json({ message: result.message });
+      return;
+    }
+    if (result.status === 'unchanged') {
+      res.status(200).json({ status: 'unchanged', message: '時間沒有變更' });
+      return;
+    }
+    log.logFormat(`${ret['name']} (${account}) ${action} clock-in segment ${result.num} of ${user.name} (${id}) on ${date}.`);
+    res.status(200).json({ status: 'saved', num: result.num });
+  } catch (e) {
+    log.logFormat((e as string), new Date());
+    res.sendStatus(500);
+  }
+}
+
+app.post('/api/clockin/segment/edit', (req: Request, res: Response) => handleSegmentChange('edit', req, res));
+app.post('/api/clockin/segment/add', (req: Request, res: Response) => handleSegmentChange('add', req, res));
+app.post('/api/clockin/segment/delete', (req: Request, res: Response) => handleSegmentChange('delete', req, res));
 
 app.get('/api/clockin/master', async (req: Request, res: Response) => {
   try {
@@ -675,21 +818,28 @@ function indexEdits(edits: ClockEdit[]): Map<string, ClockEdit> {
 function summarizeClockinDay(
   punches: Array<{ id: string; name: string; date: string; num: number; clockin: string | null; clockout: string | null }>,
   edit: ClockEdit | null,
-  fallbackName: string
+  fallbackName: string,
+  segmentEdit: ClockEdit | null = null
 ): {
   clockin: string | null;
   clockout: string | null;
+  workHours: string;
+  workMinutes: number;
+  incompleteSegments: number;
   hasRecord: boolean;
   modified: boolean;
   reason: string;
   editorName: string | null;
   editedAt: string | null;
 } {
-  const row = aggregateDay(punches, edit, fallbackName);
+  const row = aggregateDay(punches, edit, fallbackName, segmentEdit);
   return {
     clockin: row ? row.clockin : null,
     clockout: row ? row.clockout : null,
-    hasRecord: punches.length > 0 || edit !== null,
+    workHours: row ? displayRowHours(row) : formatWorkMinutes(0),
+    workMinutes: row ? row.workMinutes : 0,
+    incompleteSegments: row ? row.incompleteSegments : 0,
+    hasRecord: punches.length > 0 || edit !== null || segmentEdit !== null,
     modified: row ? row.modified : false,
     reason: row ? row.reason : '',
     editorName: row ? row.editorName : null,

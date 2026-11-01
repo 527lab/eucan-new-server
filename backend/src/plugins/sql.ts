@@ -4,6 +4,7 @@ import logger from './logger'
 import { getSplitTimestamp, fetch_all_nwd, getROCYearsInRange } from "./dayoff_calculate"
 import { userinfo, dayoffinfo, clockinrecord, requestquery, logininfo, digit, dayofftype, dayoffinfo_ret } from "../types/types";
 import { ClockEdit, ClockSheetRow, normalizeTime } from "./clockin_sheet";
+import { decideSegmentEdit, isDuplicatePunch, mergeLegacyEdit, Segment, validateReason } from "./clockin_segments";
 import { join } from "path";
 // const logger = require("./logger.js");
 const log: logger = new logger(`./logs/${new Date().toISOString().split('T')[0]}.log`);
@@ -63,6 +64,49 @@ export class sql {
       );
     `);
     this.ensureClockinMasterEditedAtColumn();
+    this.ensureClockinSegmentSchema();
+  }
+
+  private tableColumns(table: string): string[] {
+    return (this.login_db.prepare(`PRAGMA table_info(${table});`).all() as Array<{ name: string }>).map((column) => column.name);
+  }
+
+  /**
+   * Idempotent migration for multi-segment clock-in corrections:
+   * - clockinrecord.deleted: soft delete flag (rows are never DELETEd)
+   * - clockin_segment_log: append-only audit trail of every segment add/edit/delete
+   * - clockin_master_row.work_minutes / incomplete: per-day work hours snapshot
+   */
+  private ensureClockinSegmentSchema(): void {
+    const hasRecordTable = this.login_db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'clockinrecord';`).get() != null;
+    if (hasRecordTable && !this.tableColumns('clockinrecord').includes('deleted')) {
+      this.login_db.prepare(`ALTER TABLE clockinrecord ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;`).run();
+    }
+    this.login_db.exec(`
+      CREATE TABLE IF NOT EXISTS clockin_segment_log (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL,
+        date TEXT NOT NULL,
+        num INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        old_clockin TEXT,
+        old_clockout TEXT,
+        new_clockin TEXT,
+        new_clockout TEXT,
+        reason TEXT NOT NULL,
+        editor_id TEXT NOT NULL,
+        editor_name TEXT NOT NULL,
+        edited_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS clockin_segment_log_day ON clockin_segment_log (id, date);
+    `);
+    const masterColumns = this.tableColumns('clockin_master_row');
+    if (!masterColumns.includes('work_minutes')) {
+      this.login_db.prepare(`ALTER TABLE clockin_master_row ADD COLUMN work_minutes INTEGER NOT NULL DEFAULT 0;`).run();
+    }
+    if (!masterColumns.includes('incomplete')) {
+      this.login_db.prepare(`ALTER TABLE clockin_master_row ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0;`).run();
+    }
   }
 
   private ensureClockinMasterEditedAtColumn(): void {
@@ -538,31 +582,28 @@ export class sql {
     } else {
       datetime = `${year}-${month}-${date} ${hour}:${min}`;
     }
-    const data: clockinrecord[] = (this.login_db.prepare(`SELECT * FROM clockinrecord WHERE date= ? AND id= ?;`).all(datetime.split(" ")[0], user) as clockinrecord[]);
+    const today = datetime.split(" ")[0];
+    const nowTime = datetime.split(" ")[1];
+    const data: clockinrecord[] = (this.login_db.prepare(`SELECT * FROM clockinrecord WHERE date= ? AND id= ? AND deleted = 0 ORDER BY num;`).all(today, user) as clockinrecord[]);
     if (type == 0) {
       return data;
     }
-    const name: string = (this.login_db.prepare(`SELECT name FROM userinfo WHERE id= ?;`).get(user) as userinfo)["name"];
-    if (data.length != 0) {
-      // exists, use UPDATE
-      // if(data[0][`clock${type==1?"in":"out"}`]) return null;
-      let i: number = 0;
-      for (i; i < data.length; i++) {
-        if (data[i][`clock${type == 1 ? "in" : "out"}`]) continue
-        else break;
-      }
-      if (i < data.length) {
-        // UPDATE
-        this.login_db.prepare(`UPDATE clockinrecord SET clock${type == 1 ? "in" : "out"}= ? WHERE id= ? AND num= ? AND date= ?;`).run(datetime.split(" ")[1], user, i + 1, datetime.split(" ")[0]);
-        return { "status": 200 };
-      }
-      this.login_db.prepare(`INSERT INTO clockinrecord (id,name,date,clock${type == 1 ? "in" : "out"},num) VALUES (?,?,?,?,?);`).run(user, name, datetime.split(" ")[0], datetime.split(" ")[1], i + 1);
-      // while() i++;
-      // if(data[])
-    } else {
-      // use INSERT
-      this.login_db.prepare(`INSERT INTO clockinrecord (id,name,date,clock${type == 1 ? "in" : "out"},num) VALUES (?,?,?,?,?);`).run(user, name, datetime.split(" ")[0], datetime.split(" ")[1], 1);
+    const column = type == 1 ? "clockin" : "clockout";
+    // Duplicate guard: same kind of punch less than 5 minutes after the previous one is not recorded.
+    if (isDuplicatePunch(data.map((row) => row[column]), nowTime)) {
+      return { "status": 409 };
     }
+    const name: string = (this.login_db.prepare(`SELECT name FROM userinfo WHERE id= ?;`).get(user) as userinfo)["name"];
+    // Fill the first live segment missing this kind of punch, otherwise open a new segment.
+    const target = data.find((row) => !row[column]);
+    if (target) {
+      this.login_db.prepare(`UPDATE clockinrecord SET ${column}= ? WHERE id= ? AND num= ? AND date= ?;`).run(nowTime, user, target.num, today);
+      return { "status": 200 };
+    }
+    // num must stay unique per person/day, soft-deleted segments included.
+    const maxRow = this.login_db.prepare(`SELECT MAX(num) AS maxNum FROM clockinrecord WHERE id= ? AND date= ?;`).get(user, today) as { maxNum: number | null };
+    const nextNum = (maxRow.maxNum || 0) + 1;
+    this.login_db.prepare(`INSERT INTO clockinrecord (id,name,date,${column},num) VALUES (?,?,?,?,?);`).run(user, name, today, nowTime, nextNum);
     return { "status": 200 };
   }
 
@@ -634,7 +675,7 @@ export class sql {
    * @param {string} month 
    */
   async clockinRecord(year: digit, month: digit): Promise<[] | clockinrecord[]> {
-    const query = (this.login_db.prepare(`SELECT * FROM clockinrecord WHERE date LIKE ?;`).all(`${year}-${month}-%`) as clockinrecord[] | []);
+    const query = (this.login_db.prepare(`SELECT * FROM clockinrecord WHERE date LIKE ? AND deleted = 0;`).all(`${year}-${month}-%`) as clockinrecord[] | []);
     return new Promise(res => { res(query) });
   }
 
@@ -837,12 +878,215 @@ export class sql {
     );
   }
 
+  /** Segments of one person/day ordered by num. Soft-deleted ones only when `includeDeleted`. */
+  clockinSegmentsForDay(id: string, date: string, includeDeleted: boolean = false): ClockSegmentRow[] {
+    const rows = this.login_db.prepare(
+      `SELECT num, clockin, clockout, deleted FROM clockinrecord
+       WHERE id = ? AND date = ? ${includeDeleted ? '' : 'AND deleted = 0'} ORDER BY num;`
+    ).all(id, date) as Array<{ num: number; clockin: string | null; clockout: string | null; deleted: number }>;
+    return rows.map((row) => ({
+      num: row.num,
+      clockin: normalizeTime(row.clockin),
+      clockout: normalizeTime(row.clockout),
+      deleted: Number(row.deleted) === 1,
+    }));
+  }
+
+  clockinSegmentLog(id: string, date: string): ClockSegmentLogEntry[] {
+    const rows = this.login_db.prepare(
+      `SELECT seq, num, action, old_clockin, old_clockout, new_clockin, new_clockout, reason, editor_id, editor_name, edited_at
+       FROM clockin_segment_log WHERE id = ? AND date = ? ORDER BY seq;`
+    ).all(id, date) as Array<{
+      seq: number; num: number; action: string; old_clockin: string | null; old_clockout: string | null;
+      new_clockin: string | null; new_clockout: string | null; reason: string; editor_id: string; editor_name: string; edited_at: string;
+    }>;
+    return rows.map((row) => ({
+      seq: row.seq,
+      num: row.num,
+      action: row.action,
+      oldClockin: row.old_clockin,
+      oldClockout: row.old_clockout,
+      newClockin: row.new_clockin,
+      newClockout: row.new_clockout,
+      reason: row.reason,
+      editorId: row.editor_id,
+      editorName: row.editor_name,
+      editedAt: row.edited_at,
+    }));
+  }
+
+  /** Latest segment-level correction per person/day for a month (clockin/clockout fields unused). */
+  clockinSegmentSummariesForMonth(year: string | number, month: string | number): ClockEdit[] {
+    const parts = this.clockMonthParts(year, month);
+    return this.segmentSummaries(`${parts.year}-${parts.month}-%`, true);
+  }
+
+  clockinSegmentSummariesForDate(date: string): ClockEdit[] {
+    return this.segmentSummaries(date, false);
+  }
+
+  hasClockinSegmentLog(id: string, date: string): boolean {
+    return this.login_db.prepare(`SELECT 1 FROM clockin_segment_log WHERE id = ? AND date = ? LIMIT 1;`).get(id, date) != null;
+  }
+
+  editClockinSegment(input: SegmentEditInput & { num: number }): SegmentEditResult {
+    return this.runSegmentEdit(input, (live) => {
+      const target = live.find((segment) => segment.num === input.num);
+      if (!target) {
+        return { ok: false, status: 404, message: '找不到這一段' };
+      }
+      const decision = decideSegmentEdit(target, input);
+      if (!decision.ok) {
+        return { ok: false, status: 400, message: decision.message };
+      }
+      if (decision.kind === 'unchanged') {
+        return { ok: true, status: 'unchanged', num: target.num };
+      }
+      this.login_db.prepare(`UPDATE clockinrecord SET clockin = ?, clockout = ? WHERE id = ? AND date = ? AND num = ?;`)
+        .run(decision.clockin, decision.clockout, input.id, input.date, target.num);
+      this.logSegment(input, target.num, 'update', target, { clockin: decision.clockin, clockout: decision.clockout }, decision.reason);
+      return { ok: true, status: 'saved', num: target.num };
+    });
+  }
+
+  addClockinSegment(input: SegmentEditInput): SegmentEditResult {
+    return this.runSegmentEdit(input, () => {
+      const decision = decideSegmentEdit({ clockin: null, clockout: null }, input);
+      if (!decision.ok) {
+        return { ok: false, status: 400, message: decision.message };
+      }
+      if (decision.kind === 'unchanged') {
+        return { ok: false, status: 400, message: '上班與下班至少填一個' };
+      }
+      const nextNum = this.nextSegmentNum(input.id, input.date);
+      this.login_db.prepare(`INSERT INTO clockinrecord (id, name, date, clockin, clockout, num) VALUES (?, ?, ?, ?, ?, ?);`)
+        .run(input.id, input.name, input.date, decision.clockin, decision.clockout, nextNum);
+      this.logSegment(input, nextNum, 'add', { clockin: null, clockout: null }, { clockin: decision.clockin, clockout: decision.clockout }, decision.reason);
+      return { ok: true, status: 'saved', num: nextNum };
+    });
+  }
+
+  /** Soft delete: the row stays in clockinrecord with deleted = 1 and is logged. */
+  deleteClockinSegment(input: SegmentEditInput & { num: number }): SegmentEditResult {
+    return this.runSegmentEdit(input, (live) => {
+      const target = live.find((segment) => segment.num === input.num);
+      if (!target) {
+        return { ok: false, status: 404, message: '找不到這一段' };
+      }
+      const reason = validateReason(input.reason);
+      if (!reason.ok) {
+        return { ok: false, status: 400, message: reason.message };
+      }
+      this.login_db.prepare(`UPDATE clockinrecord SET deleted = 1 WHERE id = ? AND date = ? AND num = ?;`).run(input.id, input.date, target.num);
+      this.logSegment(input, target.num, 'delete', target, { clockin: null, clockout: null }, reason.reason);
+      return { ok: true, status: 'saved', num: target.num };
+    });
+  }
+
+  private runSegmentEdit(input: SegmentEditInput, action: (live: ClockSegmentRow[]) => SegmentEditResult): SegmentEditResult {
+    const run = this.login_db.transaction((): SegmentEditResult => {
+      this.foldLegacyEdit(input.id, input.date, input.name);
+      const live = this.clockinSegmentsForDay(input.id, input.date, false);
+      const result = action(live);
+      if (!result.ok || result.status === 'unchanged') {
+        // Roll back the legacy fold too, so a rejected or no-op request changes nothing.
+        throw new SegmentRejected(result);
+      }
+      return result;
+    });
+    try {
+      return run();
+    } catch (e) {
+      if (e instanceof SegmentRejected) {
+        return e.result;
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * First segment edit of a day that has a legacy clockin_edit row: copy its first-in / last-out into
+   * the segments (logged as 'legacy-merge') so the day looks the same. The clockin_edit row is kept.
+   */
+  private foldLegacyEdit(id: string, date: string, name: string): void {
+    if (this.hasClockinSegmentLog(id, date)) {
+      return;
+    }
+    const legacy = this.login_db.prepare(
+      `SELECT clockin, clockout, reason, editor_id, editor_name, edited_at FROM clockin_edit WHERE id = ? AND date = ?;`
+    ).get(id, date) as { clockin: string | null; clockout: string | null; reason: string; editor_id: string; editor_name: string; edited_at: string } | undefined;
+    if (!legacy) {
+      return;
+    }
+    const live = this.clockinSegmentsForDay(id, date, false);
+    const changes = mergeLegacyEdit(live, { clockin: normalizeTime(legacy.clockin), clockout: normalizeTime(legacy.clockout) }, this.nextSegmentNum(id, date));
+    const insertLog = this.login_db.prepare(
+      `INSERT INTO clockin_segment_log (id, date, num, action, old_clockin, old_clockout, new_clockin, new_clockout, reason, editor_id, editor_name, edited_at)
+       VALUES (?, ?, ?, 'legacy-merge', ?, ?, ?, ?, ?, ?, ?, ?);`
+    );
+    for (const change of changes) {
+      if (change.created) {
+        this.login_db.prepare(`INSERT INTO clockinrecord (id, name, date, clockin, clockout, num) VALUES (?, ?, ?, ?, ?, ?);`)
+          .run(id, name, date, change.after.clockin, change.after.clockout, change.num);
+      } else {
+        this.login_db.prepare(`UPDATE clockinrecord SET clockin = ?, clockout = ? WHERE id = ? AND date = ? AND num = ?;`)
+          .run(change.after.clockin, change.after.clockout, id, date, change.num);
+      }
+      insertLog.run(id, date, change.num, change.before.clockin, change.before.clockout, change.after.clockin, change.after.clockout,
+        legacy.reason || '舊補正', legacy.editor_id, legacy.editor_name, legacy.edited_at);
+    }
+    if (changes.length === 0) {
+      // Nothing to copy, but still mark the day as segment-mode with an audit row.
+      insertLog.run(id, date, 0, null, null, normalizeTime(legacy.clockin), normalizeTime(legacy.clockout),
+        legacy.reason || '舊補正', legacy.editor_id, legacy.editor_name, legacy.edited_at);
+    }
+  }
+
+  private nextSegmentNum(id: string, date: string): number {
+    const row = this.login_db.prepare(`SELECT MAX(num) AS maxNum FROM clockinrecord WHERE id = ? AND date = ?;`).get(id, date) as { maxNum: number | null };
+    return (row.maxNum || 0) + 1;
+  }
+
+  private logSegment(
+    input: SegmentEditInput,
+    num: number,
+    action: string,
+    before: { clockin: string | null; clockout: string | null },
+    after: { clockin: string | null; clockout: string | null },
+    reason: string
+  ): void {
+    this.login_db.prepare(
+      `INSERT INTO clockin_segment_log (id, date, num, action, old_clockin, old_clockout, new_clockin, new_clockout, reason, editor_id, editor_name, edited_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%d %H:%M', 'now', '+8 hours'));`
+    ).run(input.id, input.date, num, action, before.clockin, before.clockout, after.clockin, after.clockout, reason, input.editorId, input.editorName);
+  }
+
+  private segmentSummaries(datePattern: string, like: boolean): ClockEdit[] {
+    const rows = this.login_db.prepare(
+      `SELECT l.id, l.date, l.reason, l.editor_id, l.editor_name, l.edited_at
+       FROM clockin_segment_log l
+       JOIN (SELECT id, date, MAX(seq) AS seq FROM clockin_segment_log WHERE date ${like ? 'LIKE' : '='} ? GROUP BY id, date) latest
+         ON latest.seq = l.seq;`
+    ).all(datePattern) as Array<{ id: string; date: string; reason: string; editor_id: string; editor_name: string; edited_at: string }>;
+    return rows.map((row) => ({
+      id: row.id,
+      name: '',
+      date: row.date,
+      clockin: null,
+      clockout: null,
+      reason: row.reason || '',
+      editorId: row.editor_id,
+      editorName: row.editor_name,
+      editedAt: row.edited_at,
+    }));
+  }
+
   replaceClockinMaster(year: string | number, month: string | number, rows: ClockSheetRow[]): void {
     const parts = this.clockMonthParts(year, month);
     const remove = this.login_db.prepare(`DELETE FROM clockin_master_row WHERE year = ? AND month = ?;`);
     const insert = this.login_db.prepare(
-      `INSERT INTO clockin_master_row (year, month, date, id, name, clockin, clockout, modified, reason, edited_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
+      `INSERT INTO clockin_master_row (year, month, date, id, name, clockin, clockout, modified, reason, edited_at, work_minutes, incomplete)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
     );
     const mark = this.login_db.prepare(
       `INSERT INTO clockin_master (year, month, generated_at)
@@ -863,7 +1107,9 @@ export class sql {
           row.clockout,
           row.modified ? 1 : 0,
           row.modified ? row.reason : '',
-          row.modified ? row.editedAt : null
+          row.modified ? row.editedAt : null,
+          row.workMinutes,
+          row.incompleteSegments
         );
       }
       mark.run(parts.year, parts.month);
@@ -881,11 +1127,11 @@ export class sql {
     const parts = this.clockMonthParts(year, month);
     const rows = (id == null
       ? this.login_db.prepare(
-        `SELECT date, id, name, clockin, clockout, modified, reason, edited_at
+        `SELECT date, id, name, clockin, clockout, modified, reason, edited_at, work_minutes, incomplete
          FROM clockin_master_row WHERE year = ? AND month = ?;`
       ).all(parts.year, parts.month)
       : this.login_db.prepare(
-        `SELECT date, id, name, clockin, clockout, modified, reason, edited_at
+        `SELECT date, id, name, clockin, clockout, modified, reason, edited_at, work_minutes, incomplete
          FROM clockin_master_row WHERE year = ? AND month = ? AND id = ?;`
       ).all(parts.year, parts.month, id)) as ClockMasterSqlRow[];
     const mapped = rows.map((row) => this.toClockSheetRow(row));
@@ -962,9 +1208,48 @@ export class sql {
       reason: modified ? (row.reason || '') : '',
       editorName: null,
       editedAt: modified ? (row.edited_at || null) : null,
+      workMinutes: Number(row.work_minutes) || 0,
+      incompleteSegments: Number(row.incomplete) || 0,
     };
   }
 
+}
+
+export type ClockSegmentRow = Segment & { deleted: boolean };
+
+export type ClockSegmentLogEntry = {
+  seq: number;
+  num: number;
+  action: string;
+  oldClockin: string | null;
+  oldClockout: string | null;
+  newClockin: string | null;
+  newClockout: string | null;
+  reason: string;
+  editorId: string;
+  editorName: string;
+  editedAt: string;
+};
+
+export type SegmentEditInput = {
+  id: string;
+  name: string;
+  date: string;
+  clockin?: string | null;
+  clockout?: string | null;
+  reason: string;
+  editorId: string;
+  editorName: string;
+};
+
+export type SegmentEditResult =
+  | { ok: true; status: 'saved' | 'unchanged'; num: number }
+  | { ok: false; status: 400 | 404; message: string };
+
+class SegmentRejected extends Error {
+  constructor(public result: SegmentEditResult) {
+    super('segment edit rejected');
+  }
 }
 
 type ClockEditSqlRow = {
@@ -988,6 +1273,8 @@ type ClockMasterSqlRow = {
   modified: number;
   reason: string | null;
   edited_at: string | null;
+  work_minutes: number | null;
+  incomplete: number | null;
 };
 
 function calculate(startDate: Date, endDate: Date): { m: number, d: number } {

@@ -71,7 +71,13 @@ $(function() {
             alert(`${message} 打卡成功`);
             setTimeout(() => location.reload(), 500); // 延遲 0.5 秒後重新整理頁面
         })
-        .fail(() => {
+        .fail((xhr) => {
+            if (xhr && xhr.status === 409) {
+                // 距離上一筆同類打卡不到 5 分鐘，伺服器沒有記錄
+                alert(`已打過${message}卡`);
+                btn.prop("disabled", false);
+                return;
+            }
             alert(`${message} 打卡失敗，請稍後再試`);
             btn.prop("disabled", false); // 失敗後恢復按鈕
         });
